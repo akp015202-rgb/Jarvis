@@ -77,6 +77,18 @@ android {
             android:name=".JarvisService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+        <service
+            android:name=".JarvisAccess"
+            android:exported="true"
+            android:label="Jarvis auto-send"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/jarvis_access" />
+        </service>
     </application>
 </manifest>
 === app/src/main/java/com/jarvis/app/MainActivity.kt ===
@@ -160,6 +172,9 @@ class MainActivity : Activity() {
             })
             addView(btn("Battery: No restrictions") {
                 startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            })
+            addView(btn("WhatsApp auto-send: Accessibility ON karo") {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             })
             addView(status)
         }
@@ -414,7 +429,11 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         if (stopped) return
         status("Mic on ho raha hai...")
         begin(lang, listener(
-            onText = { t -> think(t) },
+            onText = { t ->
+                if (Regex("^\\s*(band|bas|stop|bye|ruk|ruko|exit)\\b").containsMatchIn(t.lowercase())) {
+                    speak("Theek hai boss") { idle() }
+                } else think(t)
+            },
             onFail = { code ->
                 if (lang == "hi-IN" && (code == 12 || code == 13)) command("en-IN")
                 else {
@@ -503,13 +522,18 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         }
         val m = Regex("ACTION:\\s*(\\{.*\\})", RegexOption.DOT_MATCHES_ALL).find(a)
         val say = a.replace(Regex("ACTION:.*", RegexOption.DOT_MATCHES_ALL), "").trim()
-        speak(say.ifBlank { "Ho gaya boss" }.take(300)) { idle() }
+        val isErr = a.startsWith("Error") || a.startsWith("Gemini")
+        val hasAction = m != null
+        speak(say.ifBlank { "Ho gaya boss" }.take(300)) {
+            if (isErr || hasAction) idle() else command("hi-IN")
+        }
         if (m != null) {
             try { act(JSONObject(m.groupValues[1])) } catch (_: Exception) {}
         }
     }
 
     private fun act(a: JSONObject) {
+        if (a.optString("type") == "whatsapp") AutoSend.until = System.currentTimeMillis() + 25000
         when (a.optString("type")) {
             "torch" -> {
                 val cm = getSystemService(CAMERA_SERVICE) as CameraManager
@@ -574,4 +598,51 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         tts?.shutdown()
         super.onDestroy()
     }
+}
+=== app/src/main/res/values/strings.xml ===
+<resources>
+    <string name="access_desc">WhatsApp message apne aap send karne ke liye. Sirf Jarvis ke bheje message par kaam karta hai.</string>
+</resources>
+=== app/src/main/res/xml/jarvis_access.xml ===
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="200"
+    android:packageNames="com.whatsapp,com.whatsapp.w4b"
+    android:description="@string/access_desc" />
+=== app/src/main/java/com/jarvis/app/JarvisAccess.kt ===
+package com.jarvis.app
+
+import android.accessibilityservice.AccessibilityService
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+
+object AutoSend {
+    @Volatile
+    var until = 0L
+}
+
+class JarvisAccess : AccessibilityService() {
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        if (System.currentTimeMillis() > AutoSend.until) return
+        val root = rootInActiveWindow ?: return
+        val pkg = root.packageName?.toString() ?: return
+        if (!pkg.startsWith("com.whatsapp")) return
+        val cands = root.findAccessibilityNodeInfosByViewId(pkg + ":id/send") +
+            root.findAccessibilityNodeInfosByText("Send")
+        val btn = cands.firstOrNull { n ->
+            val d = n.contentDescription?.toString() ?: ""
+            d.contains("send", true) || d.contains("भेजें")
+        } ?: return
+        var n: AccessibilityNodeInfo? = btn
+        while (n != null && !n.isClickable) n = n.parent
+        if (n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            AutoSend.until = 0L
+        }
+    }
+
+    override fun onInterrupt() {}
 }
