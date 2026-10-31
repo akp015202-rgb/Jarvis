@@ -140,7 +140,8 @@ class MainActivity : Activity() {
             setPadding(48, 80, 48, 48)
             addView(title)
             addView(gk)
-            addView(btn("Start Jarvis") { startJ() })
+            addView(btn("BOLO (tap karke)") { startJ(true) })
+            addView(btn("Start Jarvis (Jarvis bolke)") { startJ() })
             addView(btn("Stop") {
                 stopService(Intent(this@MainActivity, JarvisService::class.java))
                 status.text = "Jarvis band."
@@ -153,7 +154,10 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun startJ() {
+    private var pendingTalk = false
+
+    private fun startJ(talk: Boolean = false) {
+        pendingTalk = talk
         getSharedPreferences("j", MODE_PRIVATE).edit()
             .putString("gk", gk.text.toString().trim())
             .apply()
@@ -162,19 +166,19 @@ class MainActivity : Activity() {
         if (need.isNotEmpty()) {
             requestPermissions(need.toTypedArray(), 1)
         } else {
-            launchService()
+            launchService(pendingTalk)
         }
     }
 
-    private fun launchService() {
-        startForegroundService(Intent(this, JarvisService::class.java))
-        status.text = "Jarvis chal raha hai. \"Jarvis\" bolo."
+    private fun launchService(talk: Boolean) {
+        startForegroundService(Intent(this, JarvisService::class.java).putExtra("talk", talk))
+        status.text = "Jarvis chal raha hai. Notification me status dekho."
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
         super.onRequestPermissionsResult(code, perms, res)
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-            launchService()
+            launchService(pendingTalk)
         } else {
             status.text = "Mic permission chahiye."
         }
@@ -191,6 +195,8 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -210,7 +216,7 @@ import java.net.URL
 import java.util.Locale
 
 private const val SYSTEM = """Tum Jarvis ho, Iron Man wale assistant jaise. User ko boss bolo.
-Roman Hinglish me 1-2 chhote vaakya me jawab do, koi markdown ya emoji nahi.
+Roman Hinglish me 1 chhota vaakya me jawab do (bahut short), koi markdown ya emoji nahi.
 Agar phone ka kaam ho to jawab ke baad nayi line me likho: ACTION: {json}
 Allowed json: {"type":"open_app","name":"YouTube"}, {"type":"call","number":"..."}, {"type":"youtube","q":"..."}, {"type":"maps","q":"..."}, {"type":"url","url":"https://..."}, {"type":"whatsapp","number":"91...","text":"..."}, {"type":"alarm","hour":7,"minute":30}, {"type":"torch","on":true}
 Kaam na ho to ACTION line mat likho."""
@@ -224,11 +230,25 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private var rec: SpeechRecognizer? = null
     private var started = false
     private var stopped = false
+    private var sid = 0
     private val history = JSONArray()
     private val prefs by lazy { getSharedPreferences("j", MODE_PRIVATE) }
     private val nm by lazy { getSystemService(NotificationManager::class.java) }
 
     override fun onBind(i: Intent?): IBinder? = null
+
+    private fun note(text: String): Notification =
+        Notification.Builder(this, "jarvis")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("Jarvis ON")
+            .setContentText(text)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .build()
+
+    private fun status(text: String) {
+        nm.notify(1, note(text))
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -238,18 +258,12 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         nm.createNotificationChannel(
             NotificationChannel("jarvis_act", "Jarvis actions", NotificationManager.IMPORTANCE_HIGH)
         )
-        val n = Notification.Builder(this, "jarvis")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("Jarvis ON")
-            .setContentText("\"Jarvis\" bolo")
-            .setOngoing(true)
-            .build()
-        startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        startForeground(1, note("Start ho raha hai..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         tts = TextToSpeech(this, this)
     }
 
-    override fun onInit(status: Int) {
-        ttsOk = status == TextToSpeech.SUCCESS
+    override fun onInit(s: Int) {
+        ttsOk = s == TextToSpeech.SUCCESS
         if (ttsOk) {
             tts?.language = Locale("en", "IN")
             tts?.setPitch(0.85f)
@@ -257,11 +271,26 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+        val talk = i?.getBooleanExtra("talk", false) == true
         if (!started) {
             started = true
-            main.postDelayed({ passive() }, 1500)
+            main.postDelayed({ if (talk) beepThenCommand() else passive() }, 800)
+        } else if (talk) {
+            main.post { beepThenCommand() }
         }
         return START_STICKY
+    }
+
+    private fun beep() {
+        try {
+            ToneGenerator(AudioManager.STREAM_MUSIC, 80).startTone(ToneGenerator.TONE_PROP_ACK, 120)
+        } catch (_: Exception) {}
+    }
+
+    private fun beepThenCommand() {
+        tts?.stop()
+        beep()
+        main.postDelayed({ command("hi-IN") }, 250)
     }
 
     private fun speak(text: String, then: () -> Unit) {
@@ -275,12 +304,13 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, System.nanoTime().toString())
     }
 
-    private fun listener(onText: (String) -> Unit, onFail: () -> Unit) = object : RecognitionListener {
+    private fun listener(onText: (String) -> Unit, onFail: (Int) -> Unit) = object : RecognitionListener {
         override fun onResults(b: Bundle?) {
+            sid++
             val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-            if (t.isNullOrBlank()) onFail() else onText(t)
+            if (t.isNullOrBlank()) onFail(0) else onText(t)
         }
-        override fun onError(e: Int) { onFail() }
+        override fun onError(e: Int) { sid++; onFail(e) }
         override fun onReadyForSpeech(p: Bundle?) {}
         override fun onBeginningOfSpeech() {}
         override fun onRmsChanged(v: Float) {}
@@ -290,47 +320,78 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         override fun onEvent(t: Int, b: Bundle?) {}
     }
 
+    private fun resetRec() {
+        try { rec?.destroy() } catch (_: Exception) {}
+        rec = null
+    }
+
     private fun begin(lang: String, l: RecognitionListener): Boolean {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            Toast.makeText(this, "Speech service nahi mili. Google app install karo.", Toast.LENGTH_LONG).show()
-            stopSelf()
+            Toast.makeText(this, "Speech service nahi mili. Google app install/update karo.", Toast.LENGTH_LONG).show()
+            status("Speech service nahi mili")
             return false
         }
-        rec?.destroy()
-        val r = SpeechRecognizer.createSpeechRecognizer(this)
-        rec = r
+        val r = rec ?: SpeechRecognizer.createSpeechRecognizer(this).also { rec = it }
+        try { r.cancel() } catch (_: Exception) {}
         r.setRecognitionListener(l)
-        r.startListening(
-            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
-        )
+        sid++
+        val mine = sid
+        // agar recognizer chupchap atak jaye toh restart
+        main.postDelayed({ if (mine == sid && !stopped) { resetRec(); passive() } }, 15000)
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+        if (lang == "en-IN") {
+            i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        } else {
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
+        }
+        r.startListening(i)
         return true
+    }
+
+    private fun errName(e: Int) = when (e) {
+        1 -> "network timeout"; 2 -> "network"; 3 -> "audio"; 4 -> "server"
+        5 -> "client"; 8 -> "busy"; 9 -> "mic permission nahi"; 10 -> "too many requests"
+        11 -> "server disconnected"; 12, 13 -> "language"; else -> "code $e"
     }
 
     // "Jarvis" sunne ka wait (loop)
     private fun passive() {
         if (stopped) return
+        status("Sun raha hoon: \"Jarvis\" bolo")
         begin("en-IN", listener(
             onText = { t ->
                 if (WAKE.containsMatchIn(t.lowercase())) {
-                    speak("Haan boss") { command() }
+                    status("Jarvis suna!")
+                    beepThenCommand()
                 } else passive()
             },
-            onFail = { main.postDelayed({ passive() }, 300) }
+            onFail = { code ->
+                if (code != 0 && code != 6 && code != 7) status("Mic: " + errName(code))
+                if (code in listOf(3, 5, 8, 9, 11, 12, 13)) resetRec()
+                val wait = when (code) { 8, 5, 3 -> 1200L; 10 -> 5000L; else -> 200L }
+                main.postDelayed({ passive() }, wait)
+            }
         ))
     }
 
-    // wake word ke baad asli command
-    private fun command() {
+    // wake word / BOLO button ke baad asli command
+    private fun command(lang: String) {
         if (stopped) return
-        begin("hi-IN", listener(
+        status("Boliye boss...")
+        begin(lang, listener(
             onText = { t -> think(t) },
-            onFail = { passive() }
+            onFail = { code ->
+                if (lang == "hi-IN" && (code == 12 || code == 13)) command("en-IN")
+                else { if (code in listOf(3, 5, 8)) resetRec(); passive() }
+            }
         ))
     }
 
     private fun think(q: String) {
+        status("Soch raha hoon: " + q.take(40))
         Thread {
             val reply = askGemini(q)
             main.post { respond(reply) }
@@ -341,46 +402,71 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         .put("role", role)
         .put("parts", JSONArray().put(JSONObject().put("text", text)))
 
+    private fun post(model: String, key: String, body: String): String {
+        val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+            .openConnection() as HttpURLConnection
+        c.setRequestProperty("x-goog-api-key", key)
+        c.requestMethod = "POST"
+        c.doOutput = true
+        c.connectTimeout = 15000
+        c.readTimeout = 30000
+        c.setRequestProperty("Content-Type", "application/json")
+        c.outputStream.use { it.write(body.toByteArray()) }
+        val stream = if (c.responseCode < 400) c.inputStream else c.errorStream
+        return stream.bufferedReader().readText()
+    }
+
     private fun askGemini(q: String): String {
-        val key = prefs.getString("gk", "") ?: ""
+        val key = (prefs.getString("gk", "") ?: "").trim()
         history.put(turn("user", q))
-        return try {
+        try {
             val body = JSONObject()
                 .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
                 .put("contents", history)
-                .put("generationConfig", JSONObject().put("maxOutputTokens", 1024))
-            val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
-                .openConnection() as HttpURLConnection
-            c.setRequestProperty("x-goog-api-key", key)
-            c.requestMethod = "POST"
-            c.doOutput = true
-            c.connectTimeout = 15000
-            c.readTimeout = 30000
-            c.setRequestProperty("Content-Type", "application/json")
-            c.outputStream.use { it.write(body.toString().toByteArray()) }
-            val stream = if (c.responseCode < 400) c.inputStream else c.errorStream
-            val s = stream.bufferedReader().readText()
-            val j = JSONObject(s)
+                .put("generationConfig", JSONObject().put("maxOutputTokens", 512))
+                .toString()
+            var s = ""
+            var j = JSONObject()
+            // pehle tez (lite) model, na chale toh normal flash
+            for (m in listOf("gemini-flash-lite-latest", "gemini-flash-latest")) {
+                s = post(m, key, body)
+                j = JSONObject(s)
+                val code = j.optJSONObject("error")?.optInt("code") ?: 0
+                if (code != 404 && code != 400) break
+            }
             if (j.has("error")) {
                 history.remove(history.length() - 1)
                 val er = j.getJSONObject("error")
                 return "Gemini error " + er.optInt("code") + ". " + er.optString("message").take(90)
             }
-            val text = j.getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+            val cand = j.optJSONArray("candidates")?.optJSONObject(0)
+            val parts = cand?.optJSONObject("content")?.optJSONArray("parts")
+            val sb = StringBuilder()
+            if (parts != null) {
+                for (k in 0 until parts.length()) sb.append(parts.getJSONObject(k).optString("text"))
+            }
+            val text = sb.toString().trim()
+            if (text.isEmpty()) {
+                history.remove(history.length() - 1)
+                return "Gemini ne khali jawab diya. " + (cand?.optString("finishReason") ?: s.take(80))
+            }
             history.put(turn("model", text))
             while (history.length() > 10) { history.remove(0); history.remove(0) }
-            text
+            return text
         } catch (e: Exception) {
             history.remove(history.length() - 1)
-            "Network ya Gemini key me problem hai boss."
+            return "Error. " + e.javaClass.simpleName + " " + (e.message ?: "").take(80)
         }
     }
 
     private fun respond(a: String) {
+        if (a.startsWith("Error") || a.startsWith("Gemini")) {
+            Toast.makeText(this, a.take(200), Toast.LENGTH_LONG).show()
+            status(a.take(60))
+        }
         val m = Regex("ACTION:\\s*(\\{.*\\})", RegexOption.DOT_MATCHES_ALL).find(a)
         val say = a.replace(Regex("ACTION:.*", RegexOption.DOT_MATCHES_ALL), "").trim()
-        speak(say.ifBlank { "Ho gaya boss" }) { passive() }
+        speak(say.ifBlank { "Ho gaya boss" }.take(300)) { passive() }
         if (m != null) {
             try { act(JSONObject(m.groupValues[1])) } catch (_: Exception) {}
         }
@@ -447,7 +533,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     override fun onDestroy() {
         stopped = true
         main.removeCallbacksAndMessages(null)
-        rec?.destroy()
+        resetRec()
         tts?.shutdown()
         super.onDestroy()
     }
