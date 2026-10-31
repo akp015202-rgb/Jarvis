@@ -134,6 +134,17 @@ class MainActivity : Activity() {
             setPadding(0, 40, 0, 40)
         }
 
+        val wakeBtn = btn("") { }
+        fun wakeLabel() {
+            wakeBtn.text = "Jarvis bolke jagana: " + (if (p.getBoolean("wake", false)) "ON" else "OFF")
+        }
+        wakeBtn.setOnClickListener {
+            p.edit().putBoolean("wake", !p.getBoolean("wake", false)).apply()
+            wakeLabel()
+            status.text = "Badlav ke baad Start Jarvis dabao."
+        }
+        wakeLabel()
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#02070D"))
@@ -141,7 +152,8 @@ class MainActivity : Activity() {
             addView(title)
             addView(gk)
             addView(btn("BOLO (tap karke)") { startJ(true) })
-            addView(btn("Start Jarvis (Jarvis bolke)") { startJ() })
+            addView(btn("Start Jarvis") { startJ() })
+            addView(wakeBtn)
             addView(btn("Stop") {
                 stopService(Intent(this@MainActivity, JarvisService::class.java))
                 status.text = "Jarvis band."
@@ -237,14 +249,24 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
     override fun onBind(i: Intent?): IBinder? = null
 
-    private fun note(text: String): Notification =
-        Notification.Builder(this, "jarvis")
+    private fun note(text: String): Notification {
+        val talkPi = PendingIntent.getService(
+            this, 7, Intent(this, JarvisService::class.java).putExtra("talk", true),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val act = Notification.Action.Builder(
+            android.graphics.drawable.Icon.createWithResource(this, android.R.drawable.ic_btn_speak_now),
+            "BOLO", talkPi
+        ).build()
+        return Notification.Builder(this, "jarvis")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle("Jarvis ON")
             .setContentText(text)
             .setOnlyAlertOnce(true)
             .setOngoing(true)
+            .addAction(act)
             .build()
+    }
 
     private fun status(text: String) {
         nm.notify(1, note(text))
@@ -274,23 +296,33 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         val talk = i?.getBooleanExtra("talk", false) == true
         if (!started) {
             started = true
-            main.postDelayed({ if (talk) beepThenCommand() else passive() }, 800)
+            main.postDelayed({ if (talk) beepThenCommand() else idle() }, 800)
         } else if (talk) {
             main.post { beepThenCommand() }
+        } else {
+            main.post { idle() }
         }
         return START_STICKY
     }
 
     private fun beep() {
         try {
-            ToneGenerator(AudioManager.STREAM_MUSIC, 80).startTone(ToneGenerator.TONE_PROP_ACK, 120)
+            val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+            tg.startTone(ToneGenerator.TONE_PROP_ACK, 120)
+            main.postDelayed({ tg.release() }, 400)
         } catch (_: Exception) {}
     }
 
     private fun beepThenCommand() {
         tts?.stop()
-        beep()
-        main.postDelayed({ command("hi-IN") }, 250)
+        command("hi-IN")
+    }
+
+    // wake mode OFF ho toh mic band rehta hai (BOLO dabane tak)
+    private fun idle() {
+        if (stopped) return
+        if (prefs.getBoolean("wake", false)) passive()
+        else status("Ready. BOLO dabao")
     }
 
     private fun speak(text: String, then: () -> Unit) {
@@ -304,14 +336,14 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, System.nanoTime().toString())
     }
 
-    private fun listener(onText: (String) -> Unit, onFail: (Int) -> Unit) = object : RecognitionListener {
+    private fun listener(onText: (String) -> Unit, onFail: (Int) -> Unit, onReady: () -> Unit = {}) = object : RecognitionListener {
         override fun onResults(b: Bundle?) {
             sid++
             val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
             if (t.isNullOrBlank()) onFail(0) else onText(t)
         }
         override fun onError(e: Int) { sid++; onFail(e) }
-        override fun onReadyForSpeech(p: Bundle?) {}
+        override fun onReadyForSpeech(p: Bundle?) { onReady() }
         override fun onBeginningOfSpeech() {}
         override fun onRmsChanged(v: Float) {}
         override fun onBufferReceived(b: ByteArray?) {}
@@ -337,7 +369,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         sid++
         val mine = sid
         // agar recognizer chupchap atak jaye toh restart
-        main.postDelayed({ if (mine == sid && !stopped) { resetRec(); passive() } }, 15000)
+        main.postDelayed({ if (mine == sid && !stopped) { resetRec(); idle() } }, 15000)
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
@@ -380,13 +412,18 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     // wake word / BOLO button ke baad asli command
     private fun command(lang: String) {
         if (stopped) return
-        status("Boliye boss...")
+        status("Mic on ho raha hai...")
         begin(lang, listener(
             onText = { t -> think(t) },
             onFail = { code ->
                 if (lang == "hi-IN" && (code == 12 || code == 13)) command("en-IN")
-                else { if (code in listOf(3, 5, 8)) resetRec(); passive() }
-            }
+                else {
+                    if (code in listOf(3, 5, 8)) resetRec()
+                    if (code != 0 && code != 6 && code != 7) status("Mic: " + errName(code))
+                    idle()
+                }
+            },
+            onReady = { beep(); status("Boliye boss...") }
         ))
     }
 
@@ -466,7 +503,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         }
         val m = Regex("ACTION:\\s*(\\{.*\\})", RegexOption.DOT_MATCHES_ALL).find(a)
         val say = a.replace(Regex("ACTION:.*", RegexOption.DOT_MATCHES_ALL), "").trim()
-        speak(say.ifBlank { "Ho gaya boss" }.take(300)) { passive() }
+        speak(say.ifBlank { "Ho gaya boss" }.take(300)) { idle() }
         if (m != null) {
             try { act(JSONObject(m.groupValues[1])) } catch (_: Exception) {}
         }
