@@ -47,6 +47,10 @@ android {
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- NEW: contact name se number nikalne ke liye -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- NEW: seedha call lagane ke liye (nahi doge to dialer khulega) -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
 
     <queries>
         <intent>
@@ -163,7 +167,7 @@ class MainActivity : Activity() {
             setPadding(48, 80, 48, 48)
             addView(title)
             addView(gk)
-            addView(btn("BOLO (tap karke)") { startJ(true) })
+            addView(btn("BOLO (ek baar tap, mic on rahega)") { startJ(true) })
             addView(btn("Start Jarvis") { startJ() })
             addView(wakeBtn)
             addView(btn("Stop") {
@@ -188,8 +192,13 @@ class MainActivity : Activity() {
         getSharedPreferences("j", MODE_PRIVATE).edit()
             .putString("gk", gk.text.toString().trim())
             .apply()
-        val need = listOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
-            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        // contacts + call permission bhi yahin maang lete hain
+        val need = listOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.POST_NOTIFICATIONS,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.CALL_PHONE
+        ).filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (need.isNotEmpty()) {
             requestPermissions(need.toTypedArray(), 1)
         } else {
@@ -199,7 +208,10 @@ class MainActivity : Activity() {
 
     private fun launchService(talk: Boolean) {
         startForegroundService(Intent(this, JarvisService::class.java).putExtra("talk", talk))
-        status.text = "Jarvis chal raha hai. Notification me status dekho."
+        status.text = if (checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED)
+            "Jarvis chal raha hai. Notification me status dekho."
+        else
+            "Jarvis chal raha hai. (Contacts permission nahi di, isliye naam se call/message nahi hoga)"
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
@@ -214,12 +226,14 @@ class MainActivity : Activity() {
 === app/src/main/java/com/jarvis/app/JarvisService.kt ===
 package com.jarvis.app
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
@@ -230,11 +244,13 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.AlarmClock
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.view.KeyEvent
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
@@ -245,10 +261,25 @@ import java.util.Locale
 private const val SYSTEM = """Tum Jarvis ho, Iron Man wale assistant jaise. User ko boss bolo.
 Roman Hinglish me 1 chhota vaakya me jawab do (bahut short), koi markdown ya emoji nahi.
 Agar phone ka kaam ho to jawab ke baad nayi line me likho: ACTION: {json}
-Allowed json: {"type":"open_app","name":"YouTube"}, {"type":"call","number":"..."}, {"type":"youtube","q":"..."}, {"type":"maps","q":"..."}, {"type":"url","url":"https://..."}, {"type":"whatsapp","number":"91...","text":"..."}, {"type":"alarm","hour":7,"minute":30}, {"type":"torch","on":true}
+Allowed json:
+{"type":"open_app","name":"YouTube"} (phone ka koi bhi app, naam jaisa app ke icon ke neeche dikhta hai)
+{"type":"call","name":"contact ka naam"}
+{"type":"whatsapp","name":"contact ka naam","text":"..."}
+{"type":"sms","name":"contact ka naam","text":"..."}
+{"type":"email","subject":"...","text":"..."}
+{"type":"youtube","q":"..."}, {"type":"maps","q":"..."}, {"type":"search","q":"..."}, {"type":"url","url":"https://..."}
+{"type":"alarm","hour":7,"minute":30}, {"type":"timer","seconds":300}
+{"type":"torch","on":true}
+{"type":"volume","dir":"up"} (up/down/mute)
+{"type":"media","cmd":"play_pause"} (play_pause/next/previous)
+{"type":"settings","page":"wifi"} (wifi/bluetooth/display/sound/battery/location/airplane/apps/main)
+Contact ka naam waisa hi likho jaisa user ne bola, Roman letters me. "number" key sirf tab do jab user ne khud number bola ho (call/whatsapp/sms me "number":"..." bhi chalta hai).
 Kaam na ho to ACTION line mat likho."""
 
 private val WAKE = Regex("jarvis|jarvish|jaarvis|jarwis|जार्विस|जारविस|जार्विश|जर्विस|जारवीस|जरवीस|जार्वीस")
+private val STOP = Regex("^\\s*(band|bas|stop|bye|ruk|ruko|exit|chup)\\b")
+
+private class Res(val say: String? = null, val end: Boolean = false)
 
 class JarvisService : Service(), TextToSpeech.OnInitListener {
     private val main = Handler(Looper.getMainLooper())
@@ -261,6 +292,12 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private val history = JSONArray()
     private val prefs by lazy { getSharedPreferences("j", MODE_PRIVATE) }
     private val nm by lazy { getSystemService(NotificationManager::class.java) }
+
+    // conversation mode: BOLO ek baar dabao, "band/stop" bolne ya 3 baar chup rehne tak mic on
+    private var convo = false
+    private var silent = 0
+    private var retries = 0
+    private var lang = "hi-IN"
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -304,6 +341,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         if (ttsOk) {
             tts?.language = Locale("en", "IN")
             tts?.setPitch(0.85f)
+            tts?.setSpeechRate(1.1f)
         }
     }
 
@@ -330,12 +368,22 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
 
     private fun beepThenCommand() {
         tts?.stop()
-        command("hi-IN")
+        convo = true
+        silent = 0
+        retries = 0
+        lang = "hi-IN"
+        command(true)
+    }
+
+    private fun endConvo(msg: String) {
+        convo = false
+        speak(msg) { idle() }
     }
 
     // wake mode OFF ho toh mic band rehta hai (BOLO dabane tak)
     private fun idle() {
         if (stopped) return
+        convo = false
         if (prefs.getBoolean("wake", false)) passive()
         else status("Ready. BOLO dabao")
     }
@@ -372,7 +420,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         rec = null
     }
 
-    private fun begin(lang: String, l: RecognitionListener): Boolean {
+    private fun begin(lang: String, l: RecognitionListener, stuck: () -> Unit): Boolean {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             Toast.makeText(this, "Speech service nahi mili. Google app install/update karo.", Toast.LENGTH_LONG).show()
             status("Speech service nahi mili")
@@ -384,15 +432,17 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         sid++
         val mine = sid
         // agar recognizer chupchap atak jaye toh restart
-        main.postDelayed({ if (mine == sid && !stopped) { resetRec(); idle() } }, 15000)
+        main.postDelayed({ if (mine == sid && !stopped) { resetRec(); stuck() } }, 25000)
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
-        if (lang == "en-IN") {
+        if (lang == "en-IN" && !convo) {
             i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         } else {
-            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
-            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
+            // bolna khatam hone ke baad thoda zyada ruk ke hi mic band ho (beech me na kate)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 2500L)
         }
         r.startListening(i)
         return true
@@ -421,29 +471,43 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
                 val wait = when (code) { 8, 5, 3 -> 1200L; 10 -> 5000L; else -> 200L }
                 main.postDelayed({ passive() }, wait)
             }
-        ))
+        ), stuck = { idle() })
     }
 
-    // wake word / BOLO button ke baad asli command
-    private fun command(lang: String) {
+    // wake word / BOLO ke baad asli command. Jawab ke baad mic khud wapas on hota hai.
+    private fun command(beepOn: Boolean) {
         if (stopped) return
+        convo = true
         status("Mic on ho raha hai...")
-        begin(lang, listener(
+        val ok = begin(lang, listener(
             onText = { t ->
-                if (Regex("^\\s*(band|bas|stop|bye|ruk|ruko|exit)\\b").containsMatchIn(t.lowercase())) {
-                    speak("Theek hai boss") { idle() }
-                } else think(t)
+                silent = 0
+                retries = 0
+                if (STOP.containsMatchIn(t.lowercase())) endConvo("Theek hai boss")
+                else think(t)
             },
             onFail = { code ->
-                if (lang == "hi-IN" && (code == 12 || code == 13)) command("en-IN")
-                else {
-                    if (code in listOf(3, 5, 8)) resetRec()
-                    if (code != 0 && code != 6 && code != 7) status("Mic: " + errName(code))
-                    idle()
+                when {
+                    lang == "hi-IN" && (code == 12 || code == 13) -> { lang = "en-IN"; command(false) }
+                    code == 0 || code == 6 || code == 7 -> {
+                        silent++
+                        if (silent >= 3) endConvo("Main standby me hoon boss")
+                        else main.postDelayed({ command(false) }, 250)
+                    }
+                    code in listOf(3, 5, 8, 11) && retries < 3 -> {
+                        retries++
+                        resetRec()
+                        main.postDelayed({ command(false) }, 1000)
+                    }
+                    else -> {
+                        status("Mic: " + errName(code))
+                        idle()
+                    }
                 }
             },
-            onReady = { beep(); status("Boliye boss...") }
-        ))
+            onReady = { if (beepOn) beep(); status("Boliye boss...") }
+        ), stuck = { command(false) })
+        if (!ok) convo = false
     }
 
     private fun think(q: String) {
@@ -464,28 +528,38 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         c.setRequestProperty("x-goog-api-key", key)
         c.requestMethod = "POST"
         c.doOutput = true
-        c.connectTimeout = 15000
-        c.readTimeout = 30000
+        c.connectTimeout = 8000
+        c.readTimeout = 25000
         c.setRequestProperty("Content-Type", "application/json")
         c.outputStream.use { it.write(body.toByteArray()) }
         val stream = if (c.responseCode < 400) c.inputStream else c.errorStream
         return stream.bufferedReader().readText()
     }
 
+    private fun buildBody(noThinking: Boolean): String {
+        val gen = JSONObject().put("maxOutputTokens", if (noThinking) 220 else 512)
+        // thinking band = jawab jaldi aata hai
+        if (noThinking) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+        return JSONObject()
+            .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+            .put("contents", history)
+            .put("generationConfig", gen)
+            .toString()
+    }
+
     private fun askGemini(q: String): String {
         val key = (prefs.getString("gk", "") ?: "").trim()
         history.put(turn("user", q))
         try {
-            val body = JSONObject()
-                .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
-                .put("contents", history)
-                .put("generationConfig", JSONObject().put("maxOutputTokens", 512))
-                .toString()
             var s = ""
             var j = JSONObject()
             // pehle tez (lite) model, na chale toh normal flash
-            for (m in listOf("gemini-flash-lite-latest", "gemini-flash-latest")) {
-                s = post(m, key, body)
+            val tries = listOf(
+                "gemini-flash-lite-latest" to true, "gemini-flash-lite-latest" to false,
+                "gemini-flash-latest" to true, "gemini-flash-latest" to false
+            )
+            for ((m, fast) in tries) {
+                s = post(m, key, buildBody(fast))
                 j = JSONObject(s)
                 val code = j.optJSONObject("error")?.optInt("code") ?: 0
                 if (code != 404 && code != 400) break
@@ -516,58 +590,151 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun respond(a: String) {
-        if (a.startsWith("Error") || a.startsWith("Gemini")) {
+        val isErr = a.startsWith("Error") || a.startsWith("Gemini")
+        if (isErr) {
             Toast.makeText(this, a.take(200), Toast.LENGTH_LONG).show()
             status(a.take(60))
         }
         val m = Regex("ACTION:\\s*(\\{.*\\})", RegexOption.DOT_MATCHES_ALL).find(a)
-        val say = a.replace(Regex("ACTION:.*", RegexOption.DOT_MATCHES_ALL), "").trim()
-        val isErr = a.startsWith("Error") || a.startsWith("Gemini")
-        val hasAction = m != null
-        speak(say.ifBlank { "Ho gaya boss" }.take(300)) {
-            if (isErr || hasAction) idle() else command("hi-IN")
-        }
+        var say = a.replace(Regex("ACTION:.*", RegexOption.DOT_MATCHES_ALL), "").trim()
+        var end = false
         if (m != null) {
-            try { act(JSONObject(m.groupValues[1])) } catch (_: Exception) {}
+            try {
+                val r = act(JSONObject(m.groupValues[1]))
+                if (r.say != null) say = r.say
+                end = r.end
+            } catch (_: Exception) {}
+        }
+        speak(say.ifBlank { "Ho gaya boss" }.take(300)) {
+            if (isErr || end) idle()
+            else main.postDelayed({ command(false) }, 300) // jawab ke baad mic wapas on
         }
     }
 
-    private fun act(a: JSONObject) {
-        if (a.optString("type") == "whatsapp") AutoSend.until = System.currentTimeMillis() + 25000
-        when (a.optString("type")) {
+    // contact naam se (ya bola hua number) -> (naam, number)
+    private fun resolve(a: JSONObject): Pair<String, String>? {
+        val name = a.optString("name").trim()
+        val number = a.optString("number").trim()
+        if (name.isNotEmpty()) Contacts.find(this, name)?.let { return it }
+        if (number.count { it.isDigit() } >= 5) return (name.ifEmpty { number }) to number
+        return null
+    }
+
+    private fun act(a: JSONObject): Res {
+        val type = a.optString("type")
+        val needsContact = type in listOf("call", "whatsapp", "sms")
+        if (needsContact && a.optString("name").isNotBlank() && !Contacts.has(this))
+            return Res("Contacts ki permission chahiye boss. App me allow karo", true)
+
+        when (type) {
             "torch" -> {
                 val cm = getSystemService(CAMERA_SERVICE) as CameraManager
                 cm.setTorchMode(cm.cameraIdList[0], a.optBoolean("on", true))
             }
-            "open_app" -> openApp(a.optString("name"))
-            "call" -> go(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + a.optString("number"))))
+            "open_app" -> {
+                if (!openApp(a.optString("name"))) return Res(a.optString("name") + " app nahi mili boss")
+            }
+            "call" -> {
+                val c = resolve(a) ?: return Res("Contact nahi mila boss")
+                val uri = Uri.fromParts("tel", c.second, null)
+                val canCall = checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+                go(Intent(if (canCall) Intent.ACTION_CALL else Intent.ACTION_DIAL, uri))
+                return Res(c.first + " ko call laga raha hoon", true)
+            }
+            "whatsapp" -> {
+                val c = resolve(a) ?: return Res("Contact nahi mila boss")
+                AutoSend.until = System.currentTimeMillis() + 25000
+                go(view("https://wa.me/" + Contacts.waNumber(c.second) + "?text=" + Uri.encode(a.optString("text"))))
+                return Res(c.first + " ko WhatsApp kar raha hoon")
+            }
+            "sms" -> {
+                val c = resolve(a) ?: return Res("Contact nahi mila boss")
+                go(Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + Uri.encode(c.second)))
+                    .putExtra("sms_body", a.optString("text")))
+                return Res(c.first + " ko message khol diya")
+            }
+            "email" -> go(
+                Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:"))
+                    .putExtra(Intent.EXTRA_SUBJECT, a.optString("subject"))
+                    .putExtra(Intent.EXTRA_TEXT, a.optString("text"))
+            )
             "youtube" -> go(view("https://www.youtube.com/results?search_query=" + Uri.encode(a.optString("q"))))
             "maps" -> go(view("https://www.google.com/maps/search/" + Uri.encode(a.optString("q"))))
+            "search" -> go(view("https://www.google.com/search?q=" + Uri.encode(a.optString("q"))))
             "url" -> go(view(a.optString("url")))
-            "whatsapp" -> go(
-                view(
-                    "https://wa.me/" + a.optString("number").filter { it.isDigit() } +
-                        "?text=" + Uri.encode(a.optString("text"))
-                )
-            )
             "alarm" -> go(
                 Intent(AlarmClock.ACTION_SET_ALARM)
                     .putExtra(AlarmClock.EXTRA_HOUR, a.optInt("hour"))
                     .putExtra(AlarmClock.EXTRA_MINUTES, a.optInt("minute"))
                     .putExtra(AlarmClock.EXTRA_MESSAGE, "Jarvis")
             )
+            "timer" -> go(
+                Intent(AlarmClock.ACTION_SET_TIMER)
+                    .putExtra(AlarmClock.EXTRA_LENGTH, a.optInt("seconds", 60))
+                    .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+            )
+            "volume" -> {
+                val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                val d = when (a.optString("dir")) {
+                    "down" -> AudioManager.ADJUST_LOWER
+                    "mute" -> AudioManager.ADJUST_TOGGLE_MUTE
+                    else -> AudioManager.ADJUST_RAISE
+                }
+                am.adjustStreamVolume(AudioManager.STREAM_MUSIC, d, AudioManager.FLAG_SHOW_UI)
+            }
+            "media" -> {
+                val key = when (a.optString("cmd")) {
+                    "next" -> KeyEvent.KEYCODE_MEDIA_NEXT
+                    "previous" -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                    else -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                }
+                val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, key))
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, key))
+            }
+            "settings" -> go(
+                Intent(
+                    when (a.optString("page")) {
+                        "wifi" -> Settings.ACTION_WIFI_SETTINGS
+                        "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+                        "display" -> Settings.ACTION_DISPLAY_SETTINGS
+                        "sound" -> Settings.ACTION_SOUND_SETTINGS
+                        "battery" -> Settings.ACTION_BATTERY_SAVER_SETTINGS
+                        "location" -> Settings.ACTION_LOCATION_SOURCE_SETTINGS
+                        "airplane" -> Settings.ACTION_AIRPLANE_MODE_SETTINGS
+                        "apps" -> Settings.ACTION_APPLICATION_SETTINGS
+                        else -> Settings.ACTION_SETTINGS
+                    }
+                )
+            )
         }
+        return Res()
     }
 
     private fun view(u: String) = Intent(Intent.ACTION_VIEW, Uri.parse(u))
 
-    private fun openApp(name: String) {
+    // naam se best match wala installed app kholta hai
+    private fun openApp(name: String): Boolean {
+        val n = name.trim().lowercase()
+        if (n.isEmpty()) return false
         val pm = packageManager
         val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val hit = pm.queryIntentActivities(q, 0)
-            .firstOrNull { it.loadLabel(pm).toString().contains(name, ignoreCase = true) }
-        val li = hit?.let { pm.getLaunchIntentForPackage(it.activityInfo.packageName) }
-        if (li != null) go(li)
+        var best: String? = null
+        var bestScore = 0
+        for (ri in pm.queryIntentActivities(q, 0)) {
+            val l = ri.loadLabel(pm).toString().lowercase()
+            val s = when {
+                l == n -> 4
+                l.startsWith(n) -> 3
+                l.contains(n) -> 2
+                l.length >= 3 && n.contains(l) -> 1
+                else -> 0
+            }
+            if (s > bestScore) { bestScore = s; best = ri.activityInfo.packageName }
+        }
+        val li = best?.let { pm.getLaunchIntentForPackage(it) } ?: return false
+        go(li)
+        return true
     }
 
     // Android 10+ background se seedha activity nahi kholne deta,
@@ -597,6 +764,87 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         resetRec()
         tts?.shutdown()
         super.onDestroy()
+    }
+}
+=== app/src/main/java/com/jarvis/app/Contacts.kt ===
+package com.jarvis.app
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.provider.ContactsContract
+
+/** Phone ke contacts me naam se number dhundhta hai (thoda galat bolne par bhi chalega). */
+object Contacts {
+    fun has(ctx: Context) =
+        ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+
+    private fun norm(s: String) =
+        s.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+
+    private fun lev(a: String, b: String): Int {
+        var prev = IntArray(b.length + 1) { it }
+        for (i in 1..a.length) {
+            val cur = IntArray(b.length + 1)
+            cur[0] = i
+            for (j in 1..b.length) {
+                cur[j] = minOf(
+                    prev[j] + 1, cur[j - 1] + 1,
+                    prev[j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1
+                )
+            }
+            prev = cur
+        }
+        return prev[b.length]
+    }
+
+    private fun score(q: String, n: String): Int {
+        if (n.isEmpty()) return 0
+        if (q == n) return 100
+        if (n.startsWith(q)) return 90
+        if (n.contains(q)) return 80
+        val qt = q.split(" ")
+        val nt = n.split(" ")
+        if (qt.all { t -> nt.any { it.startsWith(t) } }) return 75
+        val fuzzy = qt.all { t ->
+            t.length >= 3 && nt.any { w -> lev(t, w) <= (if (t.length >= 5) 2 else 1) }
+        }
+        return if (fuzzy) 60 else 0
+    }
+
+    /** return: (saved name, number) ya null */
+    fun find(ctx: Context, spoken: String): Pair<String, String>? {
+        if (!has(ctx)) return null
+        val q = norm(spoken)
+        if (q.isEmpty()) return null
+        var bestScore = 0
+        var best: Pair<String, String>? = null
+        ctx.contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            ), null, null, null
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val name = c.getString(0) ?: continue
+                val num = c.getString(1) ?: continue
+                val s = score(q, norm(name))
+                if (s > bestScore) { bestScore = s; best = name to num }
+            }
+        }
+        return best
+    }
+
+    /** WhatsApp (wa.me) ke liye number: sirf digits, 10 digit ho to 91 laga do */
+    fun waNumber(raw: String): String {
+        val d = raw.filter { it.isDigit() }
+        return when {
+            raw.trim().startsWith("+") -> d
+            d.length == 10 -> "91$d"
+            d.length == 11 && d.startsWith("0") -> "91" + d.drop(1)
+            else -> d
+        }
     }
 }
 === app/src/main/res/values/strings.xml ===
