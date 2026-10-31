@@ -348,13 +348,10 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             val body = JSONObject()
                 .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
                 .put("contents", history)
-                .put(
-                    "generationConfig", JSONObject()
-                        .put("maxOutputTokens", 300)
-                        .put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
-                )
-            val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$key")
+                .put("generationConfig", JSONObject().put("maxOutputTokens", 1024))
+            val c = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
                 .openConnection() as HttpURLConnection
+            c.setRequestProperty("x-goog-api-key", key)
             c.requestMethod = "POST"
             c.doOutput = true
             c.connectTimeout = 15000
@@ -363,7 +360,13 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
             c.outputStream.use { it.write(body.toString().toByteArray()) }
             val stream = if (c.responseCode < 400) c.inputStream else c.errorStream
             val s = stream.bufferedReader().readText()
-            val text = JSONObject(s).getJSONArray("candidates").getJSONObject(0)
+            val j = JSONObject(s)
+            if (j.has("error")) {
+                history.remove(history.length() - 1)
+                val er = j.getJSONObject("error")
+                return "Gemini error " + er.optInt("code") + ". " + er.optString("message").take(90)
+            }
+            val text = j.getJSONArray("candidates").getJSONObject(0)
                 .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
             history.put(turn("model", text))
             while (history.length() > 10) { history.remove(0); history.remove(0) }
