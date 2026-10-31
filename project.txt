@@ -36,9 +36,6 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
 }
-dependencies {
-    implementation("ai.picovoice:porcupine-android:3.0.1")
-}
 === app/src/main/AndroidManifest.xml ===
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -100,7 +97,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 
 class MainActivity : Activity() {
-    private lateinit var pv: EditText
     private lateinit var gk: EditText
     private lateinit var status: TextView
 
@@ -124,10 +120,9 @@ class MainActivity : Activity() {
             setOnClickListener { f() }
         }
 
-        pv = field("Picovoice AccessKey", "pv")
         gk = field("Gemini API key", "gk")
         status = TextView(this).apply {
-            text = "Keys daalo, phir Start dabao."
+            text = "Gemini key daalo, phir Start dabao."
             setTextColor(Color.parseColor("#7FB7CC"))
             setPadding(0, 32, 0, 0)
         }
@@ -144,7 +139,6 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#02070D"))
             setPadding(48, 80, 48, 48)
             addView(title)
-            addView(pv)
             addView(gk)
             addView(btn("Start Jarvis") { startJ() })
             addView(btn("Stop") {
@@ -161,7 +155,6 @@ class MainActivity : Activity() {
 
     private fun startJ() {
         getSharedPreferences("j", MODE_PRIVATE).edit()
-            .putString("pv", pv.text.toString().trim())
             .putString("gk", gk.text.toString().trim())
             .apply()
         val need = listOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
@@ -190,9 +183,6 @@ class MainActivity : Activity() {
 === app/src/main/java/com/jarvis/app/JarvisService.kt ===
 package com.jarvis.app
 
-import ai.picovoice.porcupine.Porcupine
-import ai.picovoice.porcupine.PorcupineManager
-import ai.picovoice.porcupine.PorcupineManagerCallback
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -225,12 +215,15 @@ Agar phone ka kaam ho to jawab ke baad nayi line me likho: ACTION: {json}
 Allowed json: {"type":"open_app","name":"YouTube"}, {"type":"call","number":"..."}, {"type":"youtube","q":"..."}, {"type":"maps","q":"..."}, {"type":"url","url":"https://..."}, {"type":"whatsapp","number":"91...","text":"..."}, {"type":"alarm","hour":7,"minute":30}, {"type":"torch","on":true}
 Kaam na ho to ACTION line mat likho."""
 
+private val WAKE = Regex("jarvis|jarvish|jaarvis|jarwis|जार्विस|जारविस|जार्विश|जर्विस|जारवीस|जरवीस|जार्वीस")
+
 class JarvisService : Service(), TextToSpeech.OnInitListener {
     private val main = Handler(Looper.getMainLooper())
-    private var porc: PorcupineManager? = null
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     private var rec: SpeechRecognizer? = null
+    private var started = false
+    private var stopped = false
     private val history = JSONArray()
     private val prefs by lazy { getSharedPreferences("j", MODE_PRIVATE) }
     private val nm by lazy { getSystemService(NotificationManager::class.java) }
@@ -264,31 +257,11 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
-        if (porc == null) startWake()
-        return START_STICKY
-    }
-
-    private fun startWake() {
-        try {
-            porc = PorcupineManager.Builder()
-                .setAccessKey(prefs.getString("pv", "") ?: "")
-                .setKeyword(Porcupine.BuiltInKeyword.JARVIS)
-                .setSensitivity(0.7f)
-                .build(applicationContext, PorcupineManagerCallback { main.post { onWake() } })
-            porc?.start()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Wake word error: " + e.message, Toast.LENGTH_LONG).show()
-            stopSelf()
+        if (!started) {
+            started = true
+            main.postDelayed({ passive() }, 1500)
         }
-    }
-
-    private fun resume() {
-        try { porc?.start() } catch (_: Exception) {}
-    }
-
-    private fun onWake() {
-        try { porc?.stop() } catch (_: Exception) {}
-        speak("Haan boss") { listen() }
+        return START_STICKY
     }
 
     private fun speak(text: String, then: () -> Unit) {
@@ -302,32 +275,59 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, System.nanoTime().toString())
     }
 
-    private fun listen() {
+    private fun listener(onText: (String) -> Unit, onFail: () -> Unit) = object : RecognitionListener {
+        override fun onResults(b: Bundle?) {
+            val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            if (t.isNullOrBlank()) onFail() else onText(t)
+        }
+        override fun onError(e: Int) { onFail() }
+        override fun onReadyForSpeech(p: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(v: Float) {}
+        override fun onBufferReceived(b: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onPartialResults(b: Bundle?) {}
+        override fun onEvent(t: Int, b: Bundle?) {}
+    }
+
+    private fun begin(lang: String, l: RecognitionListener): Boolean {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            speak("Speech service nahi mili boss") { resume() }
-            return
+            Toast.makeText(this, "Speech service nahi mili. Google app install karo.", Toast.LENGTH_LONG).show()
+            stopSelf()
+            return false
         }
         rec?.destroy()
         val r = SpeechRecognizer.createSpeechRecognizer(this)
         rec = r
-        r.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(b: Bundle?) {
-                val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                if (t.isNullOrBlank()) resume() else think(t)
-            }
-            override fun onError(e: Int) { resume() }
-            override fun onReadyForSpeech(p: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(v: Float) {}
-            override fun onBufferReceived(b: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onPartialResults(b: Bundle?) {}
-            override fun onEvent(t: Int, b: Bundle?) {}
-        })
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-        r.startListening(i)
+        r.setRecognitionListener(l)
+        r.startListening(
+            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+        )
+        return true
+    }
+
+    // "Jarvis" sunne ka wait (loop)
+    private fun passive() {
+        if (stopped) return
+        begin("en-IN", listener(
+            onText = { t ->
+                if (WAKE.containsMatchIn(t.lowercase())) {
+                    speak("Haan boss") { command() }
+                } else passive()
+            },
+            onFail = { main.postDelayed({ passive() }, 300) }
+        ))
+    }
+
+    // wake word ke baad asli command
+    private fun command() {
+        if (stopped) return
+        begin("hi-IN", listener(
+            onText = { t -> think(t) },
+            onFail = { passive() }
+        ))
     }
 
     private fun think(q: String) {
@@ -377,7 +377,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     private fun respond(a: String) {
         val m = Regex("ACTION:\\s*(\\{.*\\})", RegexOption.DOT_MATCHES_ALL).find(a)
         val say = a.replace(Regex("ACTION:.*", RegexOption.DOT_MATCHES_ALL), "").trim()
-        speak(say.ifBlank { "Ho gaya boss" }) { resume() }
+        speak(say.ifBlank { "Ho gaya boss" }) { passive() }
         if (m != null) {
             try { act(JSONObject(m.groupValues[1])) } catch (_: Exception) {}
         }
@@ -420,7 +420,7 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
         if (li != null) go(li)
     }
 
-    // Android 10+ background se seedha activity khulne nahi deta,
+    // Android 10+ background se seedha activity nahi kholne deta,
     // isliye saath me full-screen/tap notification bhi bhejte hain.
     private fun go(i: Intent) {
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -442,7 +442,8 @@ class JarvisService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onDestroy() {
-        try { porc?.stop(); porc?.delete() } catch (_: Exception) {}
+        stopped = true
+        main.removeCallbacksAndMessages(null)
         rec?.destroy()
         tts?.shutdown()
         super.onDestroy()
