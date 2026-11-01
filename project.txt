@@ -1790,8 +1790,8 @@ class JarvisAccess : AccessibilityService() {
     fun back(): Boolean = performGlobalAction(GLOBAL_ACTION_BACK)
 
     /** home / back / recents / notifications / quick_settings / lock / screenshot */
-    fun system(cmd: String): Boolean = performGlobalAction(
-        when (cmd) {
+    fun system(cmd: String): Boolean {
+        val action = when (cmd) {
             "home" -> GLOBAL_ACTION_HOME
             "back" -> GLOBAL_ACTION_BACK
             "recents" -> GLOBAL_ACTION_RECENTS
@@ -1799,9 +1799,10 @@ class JarvisAccess : AccessibilityService() {
             "quick_settings" -> GLOBAL_ACTION_QUICK_SETTINGS
             "lock" -> GLOBAL_ACTION_LOCK_SCREEN
             "screenshot" -> GLOBAL_ACTION_TAKE_SCREENSHOT
-            else -> return false
+            else -> -1
         }
-    )
+        return action != -1 && performGlobalAction(action)
+    }
 
     /** Sirf password wale box me daalta hai (focused ho ya screen par jo pehla mile) */
     fun fillPassword(pw: String): Boolean {
